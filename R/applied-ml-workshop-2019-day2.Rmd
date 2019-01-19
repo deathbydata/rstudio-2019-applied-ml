@@ -1,0 +1,375 @@
+---
+title: "Applied ML - 2019 (Day 2)"
+author: "Josh Muncke"
+date: "Jan 15 - Jan 16, 2019"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    code_folding: hide
+toc_depth: 4
+theme: lumen
+number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(message = FALSE)
+```
+
+```{r load packages, message=FALSE, warning=FALSE}
+library(tidymodels)
+library(tidyverse)
+library(ggrepel)
+
+library(AmesHousing)
+library(skimr)
+library(ggridges)
+
+theme_set(theme_bw())
+```
+
+# Day 2
+
+## Setup
+Download the cars data set for regression problems...
+
+```{r download our cars data}
+url <- "https://github.com/topepo/cars/raw/master/2018_12_02_city/car_data_splits.RData"
+temp_save <- tempfile()
+download.file(url, destfile = temp_save)
+load(temp_save)
+
+car_train %>% bind_rows(car_test) %>% group_by(year) %>% count()
+```
+
+Remove some cars from the data set - mainly the non-combustion engines.
+```{r remove some cars}
+removals <- c("CNG", "Electricity")
+
+car_train <- 
+  car_train %>% 
+  dplyr::filter(!(fuel_type %in% removals)) %>%
+  mutate(fuel_type = relevel(fuel_type, "Gasoline_or_natural_gas"))
+
+car_test <-
+  car_test %>% 
+  dplyr::filter(!(fuel_type %in% removals)) %>%
+  mutate(fuel_type = relevel(fuel_type, "Gasoline_or_natural_gas"))
+```
+
+Some simple exploration on the data.
+```{r eda}
+skim(car_train)
+
+car_train %>%
+  ggplot(aes(x = mpg, colour = year)) +
+  geom_line(stat = "density") +
+  scale_x_log10()
+```
+
+## Linear models
+Reminder that "linear" in linear models means that your model is linear in the parameters. Non-linear terms can be added without issues, examples:
+
+```{r splines}
+library(splines)
+lm(mpg ~ . -model + ns(eng_displ, 4) + ns(cylinders, 4), data = car_train)
+```
+
+With `recipes` - every column has a *role*. By default the variable on the left-hand side of th `~` will be considered an `outcome`, everything else will a `predictor`.
+
+Problem is that if we want to *keep* variables that do not have a role in the recipe...we need to give them a new role.
+
+Here's a `recipe` for the cars data.
+
+```{r}
+basic_rec <- recipe(mpg ~ ., data = car_train) %>%
+  # keep the car name but don't use as a predictor
+  update_role(model, new_role = "model") %>%
+  # collapse some makes into "other"
+  step_other(make, car_class, threshold = 0.005) %>%
+  step_other(fuel_type, threshold = 0.01) %>%
+  step_dummy(all_nominal(), -model) %>%
+  step_zv(all_predictors())
+
+basic_rec
+```
+
+## Elastic Net
+
+We are going to use an Elastic Net model to predict on this dataset.
+
+*Reminder:* using a an L1 and L2 penalty. `lambda` is the regularization strength, `alpha` is the mixing term. They need to be _tuned_.
+
+Need to make sure we appropriately center and scale data.
+
+### Grid search for `glmnet` parameters
+
+Create a tuning parameter grid using `expand.grid`.
+
+```{r create tuning grid}
+alpha_range <- seq(0, 1, by = 0.25)
+lambda_range <- 10^seq(-4, -1, length = 20)
+
+glmn_grid <- expand.grid(alpha = alpha_range, lambda = lambda_range)
+
+nrow(glmn_grid) # 100 combinations / different models
+```
+
+## `caret` basics
+
+* `train` takes a model formula, `recipe` object or (`x`/`y` specification)
+* `method` specifies the type of model to fit
+* `tuneGrid` lets you specify a tuning grid and takes account of optimizations in the training process automatically (submodel trick)
+* `trainControl` how much (and how) should we resample the data to create the model?
+* Use `set.seed` right before the call to `train`.
+
+### Fitting using `caret::train`
+
+Create some non-linearity using `recipes`.
+
+```{r non linearity}
+library(caret)
+
+ctrl <- trainControl(
+  method = "cv", 
+  # Save the assessment predictions from the best model
+  savePredictions = "final",
+  # Log the progress of the tuning process
+  verboseIter = TRUE
+  )
+
+glmn_rec <- basic_rec %>%
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors()) %>%
+  step_ns(eng_displ, cylinders, options = list(df = 4))
+
+
+set.seed(92598)
+
+glmn_mod <- train(
+  glmn_rec, 
+  data = car_train,
+  method = "glmnet", 
+  trControl = ctrl,
+  tuneGrid = glmn_grid
+  )
+
+```
+
+Let's take a look at the caret results...
+
+```{r look at the results}
+glmn_mod$bestTune
+
+ggplot(glmn_mod) + scale_x_log10()
+```
+
+Helper functions for plotting results:
+```{r}
+add_columns <- function(x, dat, ...) {
+  # capture any selectors and filter the data
+  dots <- quos(...)
+  if (!is_empty(dots))
+    dat <- dplyr::select(dat, year, model, !!!dots)
+  dat <-
+    x %>%
+    pluck("pred") %>%
+    arrange(rowIndex) %>%
+    dplyr::select(-rowIndex) %>%
+    bind_cols(dat)
+  # create a label column when possible
+  if (all(c("model", "year") %in% names(dat)))
+    dat <-
+    dat %>%
+    mutate(plot_label = paste(year, model))
+  dat
+}
+
+obs_pred_plot <- function(x, dat, cutoff = 25, ...) {
+    pred_dat <- x %>%
+      add_columns(dat, model, year) %>%
+      mutate(residuals = obs - pred) 
+    ggplot(pred_dat, aes(x = pred, y = obs)) +
+      geom_abline(col = "green", alpha = .5) + 
+      geom_point(alpha = .3) + 
+      geom_smooth(
+        se = FALSE, col = "red", 
+        lty = 2, lwd = .25, alpha = .5
+      ) + 
+      geom_text_repel(
+        data = dplyr::filter(pred_dat, abs(residuals) > cutoff),
+        aes(label = plot_label),
+        segment.color = "grey50"
+      )
+}
+
+resid_plot <- function(x, dat, cutoff = 25, ...) {
+    pred_dat <- x %>%
+      add_columns(dat, model, year) %>%
+      mutate(residuals = obs - pred) 
+    ggplot(pred_dat, aes(x = pred, y = residuals)) +
+      geom_hline(col = "green", yintercept = 0) + 
+      geom_point(alpha = .3) + 
+      geom_text_repel(
+        data = dplyr::filter(
+          pred_dat, 
+          abs(residuals) > cutoff
+        ),
+        aes(label = plot_label),
+        segment.color = "grey50"
+      )
+  }
+```
+
+```{r}
+obs_pred_plot(glmn_mod, car_train)
+resid_plot(glmn_mod, car_train)
+```
+
+Examine variable importance. `caret` knows how to pull them from the model:
+```{r}
+reg_imp <- varImp(glmn_mod, scale = FALSE)
+ggplot(reg_imp, top = 30) + xlab("")
+```
+
+`predict`ing using `caret`...
+
+```{r}
+plot(glmn_mod$finalModel, xvar = "lambda")
+```
+
+There's a `finalModel` object within the model object that contains the final object *DO NOT USE `predict` ON THIS OBJECT!* Instead use `predict` on the object produced by `train`...
+
+*NO* : `predict(glmn_mod$finalModel, ...)`
+*YES* : `predict(glmn_mod, ...)` 
+
+Some magic plotting functions for `glmnet` objects.
+```{r}
+# Get the set of coefficients across penalty values
+tidy_coefs <- broom::tidy(glmn_mod$finalModel) %>%
+  dplyr::filter(term != "(Intercept)") %>% 
+  dplyr::select(-step, -dev.ratio)
+# Get the lambda closest to caret's optimal choice 
+delta <- abs(tidy_coefs$lambda - glmn_mod$bestTune$lambda)
+lambda_opt <- tidy_coefs$lambda[which.min(delta)]
+# Keep the large values
+label_coefs <- tidy_coefs %>%
+  mutate(abs_estimate = abs(estimate)) %>% 
+  dplyr::filter(abs_estimate >= 3) %>% 
+  distinct(term) %>% 
+  inner_join(tidy_coefs, by = "term") %>% 
+  dplyr::filter(lambda == lambda_opt)
+# plot the paths and highlight the large values
+tidy_coefs %>%
+  ggplot(aes(x = lambda, y = estimate, group = term, col = term, label = term)) + 
+  geom_line(alpha = .4) + 
+  theme(legend.position = "none") + 
+  scale_x_log10() + 
+  geom_text_repel(data = label_coefs, aes(x = .0005))
+```
+
+## MARS - Multivariate Adaptive Regression Splines
+
+Non-linear ML model develops sequential sets of artificial features based on hinge-functions/single-knot splines. It's basically a form of segmented regression.
+
+There's a left and right handed hinge-function which each model different sides of the data.
+
+N.B. a hinge-function is the same as a ReLU.
+
+There's a "growing" and "pruning" phase. MARS actually can do the selection phase internally using Generalized Cross Validation (faster) but we will also do it via CV in caret because it allows us to examine relationships between performance and model complexity.
+
+Mars also does feature selection apparently. Interesting stuff.
+
+Best MARS implementation is through the `earth` package. Through `caret` we can use `method = "earth"` which uses external resampling and the sub-model trick. We can tune `nprune` (number of retained features) and `degree` (amount fo interaction allowed).
+
+By the way, `caret` supports parallel...`parallel::detectCores(logical = FALSE)`
+
+```{r mars using caret}
+# library(doParallel)
+# cl <- makeCluster
+
+ctrl$verboseIter <- TRUE
+
+mars_grid <- expand.grid(degree = 1:2, 
+                         nprune = seq(2, 26, by = 2))
+
+set.seed(92598)
+mars_mod <- train(
+  basic_rec, 
+  data = car_train,
+  method = "earth",
+  tuneGrid = mars_grid,
+  trControl = ctrl
+)
+
+
+```
+Examining the final model
+
+```{r}
+plot(mars_mod)
+
+mars_mod$finalModel
+
+obs_pred_plot(mars_mod, car_train)
+resid_plot(mars_mod, car_train)
+
+mars_imp <- varImp(mars_mod)
+ggplot(mars_imp, top = 20) + xlab("")
+```
+
+## Bayesian Model Comparison
+
+Use the `resamples` method in `caret` to collect and collate cross-validation results.
+
+```{r}
+rs <- resamples(
+  list(glmnet = glmn_mod, MARS = mars_mod)
+)
+```
+
+The thing about this is that performance is correlated to resamples. 
+
+We're going to fit a mixed-effects model to these resample results to compare the models.
+
+There's a built in function to do this.
+
+```{r}
+library(tidyposterior)
+rmse_mod <- perf_mod(rs, 
+                     seed = 4344,
+                     iter = 5000,
+                     metric = "RMSE")
+```
+
+So to visualize this there's _another_ built in plotting function.
+
+```{r}
+posteriors <- tidy(rmse_mod, seed = 366784)
+ggplot(posteriors) + coord_flip()
+```
+
+## Classification
+
+Setup
+
+```{r}
+library(tidymodels)
+```
+
+`yardstick` contains helpful functions for analysis...
+
+```{r}
+two_class_example %>% conf_mat(truth = truth, estimate = predicted)
+two_class_example %>% accuracy(truth = truth, estimate = predicted)
+
+```
+
+## OKCupid Data
+```{r}
+load("../data/okc.RData")
+```
+
+
